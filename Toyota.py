@@ -1,5 +1,5 @@
 """
-Auto Sales Dashboard (Streamlit + Plotly), built for Auto_Sales_data.csv
+Sales Dashboard (Streamlit + Plotly), built for Auto_Sales_data.csv
 
 Install:
     pip install streamlit pandas plotly
