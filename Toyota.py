@@ -1,36 +1,51 @@
 """
-Sales Dashboard (Streamlit + Plotly), built for Auto_Sales_data.csv
+Sales Dashboard (Streamlit + Plotly), built for Auto Sales data
+Supports direct connection to MySQL Database or CSV file.
 
-Install:
-    pip install streamlit pandas plotly
+Install requirements:
+    py -m pip install -r requirements.txt
 
-Run (put Auto_Sales_data.csv in the same folder):
-    streamlit run auto_sales_dashboard.py
-
-Data notes (checked against your file):
-  * ORDERDATE is day/month/year (24/02/2018), so it is parsed with dayfirst.
-  * The data covers Jan 2018 to 31 May 2020. 2020 is only 5 months, so
-    year-vs-year totals would be misleading. The dashboard therefore also
-    shows a like-for-like Jan-May comparison.
-  * One row = one order line. Orders are counted with unique ORDERNUMBER.
+Run dashboard:
+    py -m streamlit run Toyota.py
 """
+import json
 from pathlib import Path
+import urllib.parse
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-CSV_PATH = Path(__file__).with_name("Auto_Sales_data.csv")
+
+# Safe import of database drivers
+try:
+    from sqlalchemy import create_engine, text
+    HAS_SQLALCHEMY = True
+except ImportError:
+    HAS_SQLALCHEMY = False
+
+# File paths
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH_SPACE = BASE_DIR / "Auto Sales data.csv"
+CSV_PATH_UNDERSCORE = BASE_DIR / "Auto_Sales_data.csv"
+CSV_PATH = CSV_PATH_SPACE if CSV_PATH_SPACE.exists() else CSV_PATH_UNDERSCORE
+CONFIG_PATH = BASE_DIR / "db_config.json"
+
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 st.set_page_config(page_title="Auto Sales Dashboard", page_icon="🚗", layout="wide")
 
 
 # ------------------------------------------------------------------
-# DATA
+# HELPERS & DATA PREPARATION
 # ------------------------------------------------------------------
-@st.cache_data
-def load_data(source) -> pd.DataFrame:
-    df = pd.read_csv(source)
-    df["ORDERDATE"] = pd.to_datetime(df["ORDERDATE"], format="%d/%m/%Y")
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize date and period columns regardless of source."""
+    df = df.copy()
+    if not pd.api.types.is_datetime64_any_dtype(df["ORDERDATE"]):
+        df["ORDERDATE"] = pd.to_datetime(df["ORDERDATE"], dayfirst=True, errors="coerce")
+    else:
+        df["ORDERDATE"] = pd.to_datetime(df["ORDERDATE"])
+
     df["year"] = df["ORDERDATE"].dt.year
     df["month"] = df["ORDERDATE"].dt.month
     df["year_month"] = df["ORDERDATE"].dt.to_period("M").dt.to_timestamp()
@@ -38,23 +53,195 @@ def load_data(source) -> pd.DataFrame:
     return df
 
 
-# --- Option: load from MySQL instead of the CSV -------------------
-# pip install sqlalchemy pymysql, then replace load_data(...) below with:
-#
-# from sqlalchemy import create_engine
-# engine = create_engine("mysql+pymysql://USER:PASSWORD@HOST:3306/DBNAME")
-# raw = pd.read_sql("SELECT * FROM auto_sales", engine)
-# raw.to_csv("Auto_Sales_data.csv", index=False)   # or adapt load_data to take a DataFrame
-# -------------------------------------------------------------------
+@st.cache_data
+def load_csv_data(source) -> pd.DataFrame:
+    df = pd.read_csv(source)
+    return prepare_dataframe(df)
 
-if CSV_PATH.exists():
-    df = load_data(CSV_PATH)
+
+def get_db_engine(user, password, host, port, dbname=None):
+    safe_password = urllib.parse.quote_plus(password)
+    db_part = f"/{dbname}" if dbname else ""
+    url = f"mysql+pymysql://{user}:{safe_password}@{host}:{port}{db_part}?charset=utf8mb4&connect_timeout=4"
+    return create_engine(url)
+
+
+def load_db_config():
+    # 1. Check Streamlit Cloud secrets first if available
+    try:
+        if hasattr(st, "secrets") and "mysql" in st.secrets:
+            sec = st.secrets["mysql"]
+            return {
+                "host": sec.get("host", "localhost"),
+                "port": int(sec.get("port", 3306)),
+                "user": sec.get("user", "root"),
+                "password": sec.get("password", ""),
+                "dbname": sec.get("dbname", "toyotadb"),
+                "table_name": sec.get("table_name", "auto sales data"),
+            }
+    except Exception:
+        pass
+
+    # 2. Check local db_config.json
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    # 3. Default fallback values
+    return {
+        "host": "localhost",
+        "port": 3306,
+        "user": "root",
+        "password": "",
+        "dbname": "toyotadb",
+        "table_name": "auto sales data",
+    }
+
+
+def save_db_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception as e:
+        st.sidebar.warning(f"Could not save config: {e}")
+
+
+# ------------------------------------------------------------------
+# SIDEBAR - DATA SOURCE & DATABASE CONNECTION
+# ------------------------------------------------------------------
+st.sidebar.title("Data Source Settings")
+saved_cfg = load_db_config()
+
+# If sqlalchemy is not installed, default to CSV File
+default_source_idx = 0 if (HAS_SQLALCHEMY and saved_cfg.get("password")) else 1
+
+source_mode = st.sidebar.radio(
+    "Select Data Source:",
+    ("MySQL Database", "CSV File"),
+    index=default_source_idx,
+)
+
+df = None
+
+if source_mode == "MySQL Database":
+    if not HAS_SQLALCHEMY:
+        st.sidebar.warning("⚠️ `sqlalchemy` or `pymysql` is not installed in this environment.")
+        st.info("💡 To connect to MySQL, add `sqlalchemy`, `pymysql`, and `cryptography` to your `requirements.txt`. Falling back to CSV file.")
+        if CSV_PATH.exists():
+            df = load_csv_data(CSV_PATH)
+        else:
+            st.error("CSV file not found.")
+            st.stop()
+    else:
+        with st.sidebar.expander("🔌 MySQL Connection Details", expanded=True):
+            db_host = st.text_input("Host", value=saved_cfg.get("host", "localhost"))
+            db_port = st.number_input("Port", value=int(saved_cfg.get("port", 3306)), step=1)
+            db_user = st.text_input("Username", value=saved_cfg.get("user", "root"))
+            db_pass = st.text_input("Password", value=saved_cfg.get("password", ""), type="password")
+            db_name = st.text_input("Database Name", value=saved_cfg.get("dbname", "toyotadb"))
+            db_table = st.text_input("Table Name", value=saved_cfg.get("table_name", "auto sales data"))
+
+            save_creds = st.checkbox("Remember configuration locally", value=True)
+            col_btn1, col_btn2 = st.columns(2)
+            connect_pressed = col_btn1.button("Connect")
+            refresh_pressed = col_btn2.button("Clear Cache")
+
+            if refresh_pressed:
+                st.cache_data.clear()
+                st.rerun()
+
+        # Attempt database connection
+        try:
+            engine = get_db_engine(db_user, db_pass, db_host, db_port, db_name)
+            # Check connection and table existence
+            with engine.connect() as conn:
+                check_table = conn.execute(text(f"SHOW TABLES LIKE '{db_table}';")).fetchall()
+
+            if not check_table:
+                st.sidebar.warning(f"Table `{db_table}` does not exist in database `{db_name}`.")
+                if CSV_PATH.exists():
+                    if st.sidebar.button(f"📥 Import {CSV_PATH.name} into MySQL"):
+                        with st.spinner("Importing CSV data to MySQL..."):
+                            raw_csv = pd.read_csv(CSV_PATH)
+                            raw_csv.to_sql(db_table, engine, if_exists="replace", index=False)
+                            st.sidebar.success(f"Imported {len(raw_csv):,} rows into `{db_table}`!")
+                            st.cache_data.clear()
+                            st.rerun()
+                st.info(f"Database `{db_name}` is connected, but table `{db_table}` needs data. Use the import button above or select CSV File.")
+                st.stop()
+            else:
+                @st.cache_data(ttl=300)
+                def fetch_from_db(_eng, table):
+                    query = f"SELECT * FROM `{table}`"
+                    data = pd.read_sql(query, _eng)
+                    return prepare_dataframe(data)
+
+                df = fetch_from_db(engine, db_table)
+                st.sidebar.success(f"Connected to MySQL! Loaded {len(df):,} rows.")
+
+                if save_creds and (connect_pressed or not CONFIG_PATH.exists()):
+                    save_db_config({
+                        "host": db_host,
+                        "port": int(db_port),
+                        "user": db_user,
+                        "password": db_pass,
+                        "dbname": db_name,
+                        "table_name": db_table,
+                    })
+
+        except Exception as e:
+            err_msg = str(e)
+            st.sidebar.error("Database connection failed.")
+            st.error(f"### ❌ Database Connection Error\n\n**Details:** `{err_msg}`")
+
+            # Specific user-friendly diagnostics
+            if "Access denied" in err_msg:
+                st.warning("👉 **Password or Username incorrect:** Please check your MySQL password and username in the sidebar.")
+            elif "Can't connect to MySQL server" in err_msg or "2003" in err_msg:
+                st.warning(
+                    "👉 **MySQL server not reachable:**\n\n"
+                    "- If running **locally**: verify that the `MySQL80` Windows service is running.\n"
+                    "- If running on **Streamlit Cloud**: a database on `localhost` cannot be reached from the cloud. Deploy your database to a cloud provider (such as TiDB Cloud, Aiven, or Supabase), or switch to the CSV File option."
+                )
+            elif "Unknown database" in err_msg:
+                st.warning(f"👉 **Database `{db_name}` does not exist yet:**")
+                if st.button(f"Create database `{db_name}` now"):
+                    try:
+                        server_eng = get_db_engine(db_user, db_pass, db_host, db_port)
+                        with server_eng.connect() as conn:
+                            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{db_name}`;"))
+                            conn.commit()
+                        st.success(f"Database `{db_name}` created successfully! Please refresh.")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Failed to create database: {ex}")
+
+            # Fallback option
+            if CSV_PATH.exists():
+                st.info("💡 You can view the dashboard using the local CSV file while database settings are being checked.")
+                if st.button("Use CSV File for now"):
+                    df = load_csv_data(CSV_PATH)
+            else:
+                st.stop()
+
+            if df is None:
+                st.stop()
+
 else:
-    up = st.sidebar.file_uploader("Upload Auto_Sales_data.csv", type="csv")
-    if up is None:
-        st.info("Place Auto_Sales_data.csv next to this script, or upload it in the sidebar.")
-        st.stop()
-    df = load_data(up)
+    # CSV file loading mode
+    if CSV_PATH.exists():
+        df = load_csv_data(CSV_PATH)
+        st.sidebar.info(f"Loaded local data from `{CSV_PATH.name}` ({len(df):,} rows).")
+    else:
+        up = st.sidebar.file_uploader("Upload Auto Sales data CSV", type="csv")
+        if up is None:
+            st.info("Place Auto Sales data.csv next to this script, or upload it in the sidebar.")
+            st.stop()
+        df = load_csv_data(up)
+
 
 # ------------------------------------------------------------------
 # FILTERS
@@ -63,7 +250,7 @@ st.sidebar.header("Filters")
 
 
 def multi(label, col):
-    opts = sorted(df[col].unique())
+    opts = sorted(df[col].dropna().unique())
     return st.sidebar.multiselect(label, opts, default=opts)
 
 
@@ -86,10 +273,10 @@ if f.empty:
     st.warning("No data for the selected filters.")
     st.stop()
 
-st.caption(f"Data range: {f['ORDERDATE'].min():%d %b %Y} to {f['ORDERDATE'].max():%d %b %Y}")
+st.caption(f"Data range: {f['ORDERDATE'].min():%d %b %Y} to {f['ORDERDATE'].max():%d %b %Y} | Total Records: {len(f):,}")
 
 # ------------------------------------------------------------------
-# KPIs
+# KPIS
 # ------------------------------------------------------------------
 orders = f["ORDERNUMBER"].nunique()
 total_sales = f["SALES"].sum()

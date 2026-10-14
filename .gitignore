@@ -1,0 +1,12 @@
+# Database configuration with local passwords
+db_config.json
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
